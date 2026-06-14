@@ -1,0 +1,10 @@
+title       = "opendota"
+baseURL     = "https://opendota-cli.tamnd.com/"
+description = "Dota 2 statistics — heroes, players, teams, and leagues from OpenDota"
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/opendota-cli"
