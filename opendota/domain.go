@@ -2,8 +2,8 @@ package opendota
 
 import (
 	"context"
-	"net/url"
-	"strings"
+	"fmt"
+	"strconv"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
@@ -14,22 +14,14 @@ import (
 //
 //	import _ "github.com/tamnd/opendota-cli/opendota"
 //
-// exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// opendota:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone opendota binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
+// The same Domain also builds the standalone opendota binary (see cli.NewApp).
 func init() { kit.Register(Domain{}) }
 
-// Domain is the opendota driver. It carries no state; the per-run client is
-// built by the factory Register hands kit.
+// Domain is the opendota driver.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme, the hostnames a pasted link is matched against,
+// and the identity reused for the binary's help and version.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "opendota",
@@ -37,41 +29,75 @@ func (Domain) Info() kit.DomainInfo {
 		Identity: kit.Identity{
 			Binary: "opendota",
 			Short:  "Dota 2 statistics — heroes, players, teams, and leagues from OpenDota",
-			Long: `Dota 2 statistics — heroes, players, teams, and leagues from OpenDota
+			Long: `opendota reads public Dota 2 statistics from the OpenDota API.
 
-opendota reads public opendota data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+Browse heroes, look up player profiles and recent matches, explore
+professional teams and leagues. No API key required.`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/opendota-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `opendota page` and
-	// `ant get opendota://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	// heroes: list all heroes
+	kit.Handle(app, kit.OpMeta{
+		Name:    "heroes",
+		Group:   "read",
+		List:    true,
+		Summary: "List all Dota 2 heroes",
+	}, heroesOp)
 
-	// List op: members of a page, the home of `opendota links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// opendota://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	// hero: get hero stats by ID
+	kit.Handle(app, kit.OpMeta{
+		Name:    "hero",
+		Group:   "read",
+		Single:  true,
+		Summary: "Get hero stats by numeric ID",
+		Args:    []kit.Arg{{Name: "id", Help: "hero numeric ID (e.g. 1 for Anti-Mage)"}},
+	}, heroOp)
+
+	// player: player profile
+	kit.Handle(app, kit.OpMeta{
+		Name:    "player",
+		Group:   "read",
+		Single:  true,
+		Summary: "Get player profile by Steam account ID",
+		Args:    []kit.Arg{{Name: "account_id", Help: "Steam account ID"}},
+	}, playerOp)
+
+	// matches: recent matches for player
+	kit.Handle(app, kit.OpMeta{
+		Name:    "matches",
+		Group:   "read",
+		List:    true,
+		Summary: "List recent matches for a player",
+		Args:    []kit.Arg{{Name: "account_id", Help: "Steam account ID"}},
+	}, matchesOp)
+
+	// teams: list professional teams
+	kit.Handle(app, kit.OpMeta{
+		Name:    "teams",
+		Group:   "read",
+		List:    true,
+		Summary: "List professional Dota 2 teams",
+	}, teamsOp)
+
+	// leagues: list leagues
+	kit.Handle(app, kit.OpMeta{
+		Name:    "leagues",
+		Group:   "read",
+		List:    true,
+		Summary: "List Dota 2 leagues and tournaments",
+	}, leaguesOp)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the client from host-resolved config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	c := DefaultConfig()
 	if cfg.UserAgent != "" {
 		c.UserAgent = cfg.UserAgent
 	}
@@ -82,92 +108,136 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 		c.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.Timeout = cfg.Timeout
 	}
-	return c, nil
+	return NewClient(c), nil
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Client *Client `kit:"inject"`
-}
-
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type limitInput struct {
 	Limit  int     `kit:"flag,inherit" help:"max results"`
 	Client *Client `kit:"inject"`
 }
 
-// --- handlers ---
-
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
-	if err != nil {
-		return mapErr(err)
-	}
-	return emit(p)
+type heroInput struct {
+	ID     string  `kit:"arg" help:"hero numeric ID"`
+	Client *Client `kit:"inject"`
 }
 
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
+type accountInput struct {
+	AccountID string `kit:"arg" help:"Steam account ID"`
+	Limit     int    `kit:"flag,inherit" help:"max results"`
+	Client    *Client `kit:"inject"`
+}
+
+// --- handlers ---
+
+func heroesOp(ctx context.Context, in limitInput, emit func(*Hero) error) error {
+	items, err := in.Client.Heroes(ctx, in.Limit)
 	if err != nil {
-		return mapErr(err)
+		return err
 	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for i := range items {
+		if err := emit(&items[i]); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full opendota.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized opendota reference: %q", input)
+func heroOp(ctx context.Context, in heroInput, emit func(*Hero) error) error {
+	id, err := strconv.Atoi(in.ID)
+	if err != nil {
+		return errs.Usage("hero id must be a number, got %q", in.ID)
 	}
-	return "page", id, nil
+	heroes, err := in.Client.HeroStats(ctx)
+	if err != nil {
+		return err
+	}
+	for i := range heroes {
+		if heroes[i].ID == id {
+			return emit(&heroes[i])
+		}
+	}
+	return errs.NotFound("hero with ID %d not found", id)
 }
 
-// Locate is the inverse: the live https URL for a (type, id).
+func playerOp(ctx context.Context, in accountInput, emit func(*Player) error) error {
+	accountID, err := strconv.Atoi(in.AccountID)
+	if err != nil {
+		return errs.Usage("account_id must be a number, got %q", in.AccountID)
+	}
+	player, err := in.Client.GetPlayer(ctx, accountID)
+	if err != nil {
+		return err
+	}
+	return emit(player)
+}
+
+func matchesOp(ctx context.Context, in accountInput, emit func(*Match) error) error {
+	accountID, err := strconv.Atoi(in.AccountID)
+	if err != nil {
+		return errs.Usage("account_id must be a number, got %q", in.AccountID)
+	}
+	items, err := in.Client.PlayerMatches(ctx, accountID, in.Limit)
+	if err != nil {
+		return err
+	}
+	for i := range items {
+		if err := emit(&items[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func teamsOp(ctx context.Context, in limitInput, emit func(*Team) error) error {
+	items, err := in.Client.Teams(ctx, in.Limit)
+	if err != nil {
+		return err
+	}
+	for i := range items {
+		if err := emit(&items[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func leaguesOp(ctx context.Context, in limitInput, emit func(*League) error) error {
+	items, err := in.Client.Leagues(ctx, in.Limit)
+	if err != nil {
+		return err
+	}
+	for i := range items {
+		if err := emit(&items[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// --- Resolver ---
+
+// Classify turns an input into the canonical (type, id).
+func (Domain) Classify(input string) (uriType, id string, err error) {
+	if input == "" {
+		return "", "", errs.Usage("empty opendota reference")
+	}
+	return "player", input, nil
+}
+
+// Locate returns the live https URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	switch uriType {
+	case "player":
+		return fmt.Sprintf("https://www.opendota.com/players/%s", id), nil
+	case "hero":
+		return fmt.Sprintf("https://www.opendota.com/heroes/%s", id), nil
+	case "team":
+		return fmt.Sprintf("https://www.opendota.com/teams/%s", id), nil
+	default:
 		return "", errs.Usage("opendota has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
-}
-
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
-func mapErr(err error) error {
-	return err
 }
